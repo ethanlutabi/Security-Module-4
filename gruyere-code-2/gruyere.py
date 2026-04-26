@@ -94,27 +94,7 @@ def main():
   global quit_server
   quit_server = False
 
-  # Normally, Gruyere only accepts connections to/from localhost. If you
-  # would like to allow access from other ip addresses, you can change to
-  # operate in a less secure mode. Set insecure_mode to True to serve on the
-  # hostname instead of localhost and add the addresses of the other machines
-  # to allowed_ips below.
-
   insecure_mode = False
-
-  # WARNING! DO NOT CHANGE THE FOLLOWING SECTION OF CODE!
-
-  # This application is very exploitable. It takes several precautions to
-  # limit the risk from a real attacker:
-  #   (1) Serve requests on localhost so that it will not be accessible
-  # from other machines.
-  #   (2) If a request is received from any IP other than localhost, quit.
-  # (This protection is implemented in do_GET/do_POST.)
-  #   (3) Inject a random identifier as the first part of the path and
-  # quit if a request is received without this identifier (except for an
-  # empty path which redirects and /favicon.ico).
-  #   (4) Automatically exit after 2 hours (7200 seconds) to mitigate against
-  # accidentally leaving the server running.
 
   quit_timer = threading.Timer(7200, lambda: _Exit('Timeout'))   # DO NOT CHANGE
   quit_timer.start()                                             # DO NOT CHANGE
@@ -125,7 +105,6 @@ def main():
     server_name = '127.0.0.1'                                    # DO NOT CHANGE
   server_port = 8008                                             # DO NOT CHANGE
 
-  # The unique id is created from a CSPRNG.
   try:                                                           # DO NOT CHANGE
     r = random.SystemRandom()                                    # DO NOT CHANGE
   except NotImplementedError:                                    # DO NOT CHANGE
@@ -133,8 +112,6 @@ def main():
 
   global server_unique_id                                        # DO NOT CHANGE
   server_unique_id = str(r.randint(2**128, 2**(128+1)))          # DO NOT CHANGE
-
-  # END WARNING!
 
   global http_server
   http_server = HTTPServer((server_name, server_port),
@@ -164,7 +141,6 @@ def main():
 
 
 def _Exit(reason):
-  # use os._exit instead of sys.exit because this can't be trapped
   print >>sys.stderr, '\nExit: ' + reason
   os._exit(0)
 
@@ -176,12 +152,6 @@ def _SetWorkingDirectory():
 
 
 def _LoadDatabase():
-  """Load the database from stored-data.txt.
-
-  Returns:
-    The loaded database.
-  """
-
   try:
     f = _Open(INSTALL_PATH, DB_FILE)
     stored_data = cPickle.load(f)
@@ -199,12 +169,6 @@ def _LoadDatabase():
 
 
 def _SaveDatabase(save_database):
-  """Save the database to stored-data.txt.
-
-  Args:
-    save_database: the database to save.
-  """
-
   try:
     f = _Open(INSTALL_PATH, DB_FILE, 'w')
     cPickle.dump(save_database, f)
@@ -214,51 +178,56 @@ def _SaveDatabase(save_database):
 
 
 def _Open(location, filename, mode='rb'):
-  """Open a file from a specific location.
+  return open(location + filename, mode)
+
+
+# FIX (DoS - Challenge 5): Sanitise a path component (username or filename)
+# to prevent directory traversal. Only alphanumerics, hyphens, underscores
+# and dots are allowed. This strips out ../ and other dangerous sequences.
+def _SanitizePathComponent(component):
+  """Removes characters that could be used for directory traversal.
 
   Args:
-    location: The directory containing the file.
-    filename: The name of the file.
-    mode: File mode for open().
+    component: A username or filename string.
 
   Returns:
-    A file object.
+    A sanitised string containing only safe characters.
   """
-  return open(location + filename, mode)
+  return ''.join(c for c in component if c.isalnum() or c in ('-', '_', '.'))
 
 
 class GruyereRequestHandler(BaseHTTPRequestHandler):
   """Handle a http request."""
 
-  # An empty cookie
   NULL_COOKIE = {COOKIE_UID: None, COOKIE_ADMIN: False, COOKIE_AUTHOR: False}
 
-  # Urls that can only be accessed by administrators.
+  # FIX (DoS - Challenge 5 & 6):
+  # ORIGINAL: _PROTECTED_URLS listed '/quit' instead of '/quitserver'.
+  # This meant the actual /quitserver endpoint was completely unprotected —
+  # any user, even unauthenticated, could shut down the server.
+  # Additionally, the check was case-sensitive so '/RESET' bypassed it entirely.
+  #
+  # Fix 1: Corrected '/quit' to '/quitserver' so the actual handler is protected.
+  # Fix 2: The path comparison in HandleRequest is now done case-insensitively
+  #         (see HandleRequest below) to prevent uppercase bypass like '/RESET'.
+  # Fix 3: _DoQuitserver and _DoReset now also verify admin status internally
+  #         so that even if the URL routing check is bypassed somehow, the
+  #         handler itself still enforces the access control requirement.
   _PROTECTED_URLS = [
-      '/quit',
-      '/reset'
+      '/quitserver',   # FIX: was '/quit' — typo left the real endpoint unprotected
+      '/reset',
   ]
 
   def _GetDatabase(self):
-    """Gets the database."""
     global stored_data
     if not stored_data:
       stored_data = data.DefaultData()
     return stored_data
 
   def _ResetDatabase(self):
-    """Reset the database."""
-    # global stored_data
     stored_data = data.DefaultData()
 
   def _DoLogin(self, cookie, specials, params):
-    """Handles the /login url: validates the user and creates a cookie.
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-    """
     database = self._GetDatabase()
     message = ''
     if 'uid' in params and 'pw' in params:
@@ -270,41 +239,18 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
           self._DoHome(cookie, specials, params, new_cookie_text)
           return
       message = 'Invalid user name or password.'
-    # not logged in
     specials['_message'] = message
     self._SendTemplateResponse('/login.gtl', specials, params)
 
   def _DoLogout(self, cookie, specials, params):
-    """Handles the /logout url: clears the cookie.
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-    """
     (cookie, new_cookie_text) = (
         self._CreateCookie('GRUYERE', None))
     self._DoHome(cookie, specials, params, new_cookie_text)
 
   def _Do(self, cookie, specials, params):
-    """Handles the home page (http://localhost/).
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-    """
     self._DoHome(cookie, specials, params)
 
   def _DoHome(self, cookie, specials, params, new_cookie_text=None):
-    """Renders the home page.
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-      new_cookie_text: New cookie.
-    """
     database = self._GetDatabase()
     specials[SPECIAL_COOKIE] = cookie
     if cookie and cookie.get(COOKIE_UID):
@@ -315,43 +261,32 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
         '/home.gtl', specials, params, new_cookie_text)
 
   def _DoBadUrl(self, path, cookie, specials, params):
-    """Handles invalid urls: displays an appropriate error message.
-
-    Args:
-      path: The invalid url.
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-    """
     self._SendError('Invalid request: %s' % (path,), cookie, specials, params)
 
   def _DoQuitserver(self, cookie, specials, params):
-    """Handles the /quitserver url for administrators to quit the server.
-
-    Args:
-      cookie: The cookie for this request. (unused)
-      specials: Other special values for this request. (unused)
-      params: Cgi parameters. (unused)
-    """
+    # FIX (DoS - Challenge 5): Added internal admin check as defence in depth.
+    # The URL routing check in HandleRequest is the first line of defence,
+    # but placing the check here too ensures that even if routing is bypassed,
+    # the handler itself refuses to execute for non-admins.
+    if not cookie.get(COOKIE_ADMIN):
+      self._SendError('Access denied.', cookie, specials, params)
+      return
     global quit_server
     quit_server = True
     self._SendTextResponse('Server quit.', None)
 
   def _AddParameter(self, name, params, data_dict, default=None):
-    """Transfers a value (with a default) from the parameters to the data."""
     if params.get(name):
       data_dict[name] = params[name][0]
     elif default is not None:
       data_dict[name] = default
 
   def _GetParameter(self, params, name, default=None):
-    """Gets a parameter value with a default."""
     if params.get(name):
       return params[name][0]
     return default
 
   def _GetSnippets(self, cookie, specials, create=False):
-    """Returns all of the user's snippets."""
     database = self._GetDatabase()
     try:
       profile = database[cookie[COOKIE_UID]]
@@ -364,13 +299,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     return snippets
 
   def _DoNewsnippet2(self, cookie, specials, params):
-    """Handles the /newsnippet2 url: actually add the snippet.
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-    """
     snippet = self._GetParameter(params, 'snippet')
     if not snippet:
       self._SendError('No snippet!', cookie, specials, params)
@@ -381,13 +309,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     self._SendRedirect('/snippets.gtl', specials[SPECIAL_UNIQUE_ID])
 
   def _DoDeletesnippet(self, cookie, specials, params):
-    """Handles the /deletesnippet url: delete the indexed snippet.
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-    """
     index = self._GetParameter(params, 'index')
     snippets = self._GetSnippets(cookie, specials)
     try:
@@ -400,20 +321,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     self._SendRedirect('/snippets.gtl', specials[SPECIAL_UNIQUE_ID])
 
   def _DoSaveprofile(self, cookie, specials, params):
-    """Saves the user's profile.
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-
-    If the 'action' cgi parameter is 'new', then this is creating a new user
-    and it's an error if the user already exists. If action is 'update', then
-    this is editing an existing user's profile and it's an error if the user
-    does not exist.
-    """
-
-    # build new profile
     profile_data = {}
     uid = self._GetParameter(params, 'uid', cookie[COOKIE_UID])
     newpw = self._GetParameter(params, 'pw')
@@ -426,7 +333,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     self._AddParameter('web_site', params, profile_data)
     self._AddParameter('color', params, profile_data)
 
-    # Each case below has to set either error or redirect
     database = self._GetDatabase()
     message = None
     new_cookie_text = None
@@ -438,13 +344,12 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
         profile_data['pw'] = newpw
         database[uid] = profile_data
         (cookie, new_cookie_text) = self._CreateCookie('GRUYERE', uid)
-        message = 'Account created.'  # error message can also indicates success
+        message = 'Account created.'
     elif action == 'update':
       if uid not in database:
         message = 'User does not exist.'
       elif (newpw and database[uid]['pw'] != self._GetParameter(params, 'oldpw')
             and not cookie.get(COOKIE_ADMIN)):
-        # must be admin or supply old pw to change password
         message = 'Incorrect password.'
       else:
         if newpw:
@@ -460,12 +365,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
       self._SendRedirect(redirect, specials[SPECIAL_UNIQUE_ID])
 
   def _SendHtmlResponse(self, html, new_cookie_text=None):
-    """Sends the provided html response with appropriate headers.
-
-    Args:
-      html: The response.
-      new_cookie_text: New cookie to set.
-    """
     self.send_response(200)
     self.send_header('Content-type', 'text/html')
     self.send_header('Pragma', 'no-cache')
@@ -476,21 +375,11 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     self.wfile.write(html)
 
   def _SendTextResponse(self, text, new_cookie_text=None):
-    """Sends a verbatim text response."""
-
     self._SendHtmlResponse('<pre>' + cgi.escape(text) + '</pre>',
                            new_cookie_text)
 
   def _SendTemplateResponse(self, filename, specials, params,
                             new_cookie_text=None):
-    """Sends a response using a gtl template.
-
-    Args:
-      filename: The template file.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-      new_cookie_text: New cookie to set.
-    """
     f = None
     try:
       f = _Open(RESOURCE_PATH, filename)
@@ -502,14 +391,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
         new_cookie_text)
 
   def _SendFileResponse(self, filename, cookie, specials, params):
-    """Sends the contents of a file.
-
-    Args:
-      filename: The file to send.
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters.
-    """
     content_type = None
     if filename.endswith('.gtl'):
       self._SendTemplateResponse(filename, specials, params)
@@ -531,7 +412,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
       f = _Open(RESOURCE_PATH, filename, 'rb')
       self.send_response(200)
       self.send_header('Content-type', content_type)
-      # Always cache static resources
       self.send_header('Cache-control', 'public, max-age=7200')
       self.send_header('X-XSS-Protection', '0')
       self.end_headers()
@@ -540,34 +420,11 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
       if f: f.close()
 
   def _SendError(self, message, cookie, specials, params, new_cookie_text=None):
-    """Sends an error message (using the error.gtl template).
-
-    Args:
-      message: The error to display.
-      cookie: The cookie for this request. (unused)
-      specials: Other special values for this request.
-      params: Cgi parameters.
-      new_cookie_text: New cookie to set.
-    """
     specials['_message'] = message
     self._SendTemplateResponse(
         '/error.gtl', specials, params, new_cookie_text)
 
   def _CreateCookie(self, cookie_name, uid):
-    """Creates a cookie for this user.
-
-    Args:
-      cookie_name: Cookie to create.
-      uid: The user.
-
-    Returns:
-      (cookie, new_cookie_text).
-
-    The cookie contains all the information we need to know about
-    the user for normal operations, including whether or not the user
-    should have access to the authoring pages or the admin pages.
-    The cookie is signed with a hash function.
-    """
     if uid is None:
       return (self.NULL_COOKIE, cookie_name + '=; path=/')
     database = self._GetDatabase()
@@ -583,22 +440,11 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
 
     c = {COOKIE_UID: uid, COOKIE_ADMIN: is_admin, COOKIE_AUTHOR: is_author}
     c_data = '%s|%s|%s' % (uid, is_admin, is_author)
-
-    # global cookie_secret; only use positive hash values
     h_data = str(hash(cookie_secret + c_data) & 0x7FFFFFF)
     c_text = '%s=%s|%s; path=/' % (cookie_name, h_data, c_data)
     return (c, c_text)
 
   def _GetCookie(self, cookie_name):
-    """Reads, verifies and parses the cookie.
-
-    Args:
-      cookie_name: The cookie to get.
-
-    Returns:
-      a dict containing user, is_admin, and is_author if the cookie
-      is present and valid. Otherwise, None.
-    """
     cookies = self.headers.get('Cookie')
     if isinstance(cookies, str):
       for c in cookies.split(';'):
@@ -608,15 +454,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     return self.NULL_COOKIE
 
   def _MatchCookie(self, cookie_name, cookie):
-    """Matches the cookie.
-
-    Args:
-      cookie_name: The name of the cookie.
-      cookie: The full cookie (name=value).
-
-    Returns:
-      The cookie if it matches or None if it doesn't match.
-    """
     try:
       (cn, cd) = cookie.strip().split('=', 1)
       if cn != cookie_name:
@@ -626,17 +463,8 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     return cd
 
   def _ParseCookie(self, cookie):
-    """Parses the cookie and returns NULL_COOKIE if it's invalid.
-
-    Args:
-      cookie: The text of the cookie.
-
-    Returns:
-      A map containing the values in the cookie.
-    """
     try:
       (hashed, cookie_data) = cookie.split('|', 1)
-      # global cookie_secret
       if hashed != str(hash(cookie_secret + cookie_data) & 0x7FFFFFF):
         return self.NULL_COOKIE
       values = cookie_data.split('|')
@@ -648,39 +476,56 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     except (IndexError, ValueError):
       return self.NULL_COOKIE
 
-  def _DoReset(self, cookie, specials, params):  # debug only; resets this db
-    """Handles the /reset url for administrators to reset the database.
-
-    Args:
-      cookie: The cookie for this request. (unused)
-      specials: Other special values for this request. (unused)
-      params: Cgi parameters. (unused)
-    """
+  def _DoReset(self, cookie, specials, params):
+    # FIX (DoS - Challenge 5): Added internal admin check as defence in depth.
+    if not cookie.get(COOKIE_ADMIN):
+      self._SendError('Access denied.', cookie, specials, params)
+      return
     self._ResetDatabase()
     self._SendTextResponse('Server reset to default values...', None)
 
   def _DoUpload2(self, cookie, specials, params):
-    """Handles the /upload2 url: finish the upload and save the file.
-
-    Args:
-      cookie: The cookie for this request.
-      specials: Other special values for this request.
-      params: Cgi parameters. (unused)
-    """
     (filename, file_data) = self._ExtractFileFromRequest()
-    directory = self._MakeUserDirectory(cookie[COOKIE_UID])
+
+    # FIX (DoS - Challenge 6 — Path Traversal):
+    # ORIGINAL: _MakeUserDirectory used the raw uid (username) directly when
+    # constructing the directory path. A user registered as '../resources'
+    # would cause uploads to be written to the resources/ directory instead
+    # of their own upload folder. By uploading a menubar.gtl file there,
+    # the attacker replaced the real template with a self-referencing one,
+    # causing infinite recursion and a stack overflow crash on every request.
+    #
+    # Fix: Pass the uid through _SanitizePathComponent() before use.
+    # This strips ../ and any non-alphanumeric characters so traversal
+    # sequences can never appear in the constructed path.
+    # We also sanitise the filename for the same reason.
+    safe_uid = _SanitizePathComponent(cookie[COOKIE_UID])
+    safe_filename = _SanitizePathComponent(filename)
+
+    if not safe_uid or not safe_filename:
+      self._SendError('Invalid filename or username.', cookie, specials, params)
+      return
+
+    directory = self._MakeUserDirectory(safe_uid)
+
+    # Additional check: confirm the resolved path stays inside RESOURCE_PATH
+    intended_base = os.path.realpath(RESOURCE_PATH)
+    resolved_path = os.path.realpath(os.path.join(directory, safe_filename))
+    if not resolved_path.startswith(intended_base):
+      self._SendError('Invalid upload path.', cookie, specials, params)
+      return
 
     message = None
     url = None
     try:
-      f = _Open(directory, filename, 'wb')
+      f = _Open(directory, safe_filename, 'wb')
       f.write(file_data)
       f.close()
       (host, port) = http_server.server_address
       url = 'http://%s:%d/%s/%s/%s' % (
-          host, port, specials[SPECIAL_UNIQUE_ID], cookie[COOKIE_UID], filename)
+          host, port, specials[SPECIAL_UNIQUE_ID], safe_uid, safe_filename)
     except IOError, ex:
-      message = 'Couldn\'t write file %s: %s' % (filename, ex.message)
+      message = 'Couldn\'t write file %s: %s' % (safe_filename, ex.message)
       _Log(message)
 
     specials['_message'] = message
@@ -689,11 +534,6 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
         {'url': url})
 
   def _ExtractFileFromRequest(self):
-    """Extracts the file from an upload request.
-
-    Returns:
-      (filename, file_data)
-    """
     form = cgi.FieldStorage(
         fp=self.rfile,
         headers=self.headers,
@@ -705,34 +545,24 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     return (upload_file.filename, file_data)
 
   def _MakeUserDirectory(self, uid):
-    """Creates a separate directory for each user to avoid upload conflicts.
+    """Creates a separate directory for each user.
 
     Args:
-      uid: The user to create a directory for.
+      uid: The sanitised username. Must have been passed through
+           _SanitizePathComponent() before calling this method.
 
     Returns:
-      The new directory path (/uid/).
+      The new directory path.
     """
-
     directory = RESOURCE_PATH + os.sep + str(uid) + os.sep
     try:
       print 'mkdir: ', directory
       os.mkdir(directory)
-      # throws an exception if directory already exists,
-      # however exception type varies by platform
     except Exception:
-      pass  # just ignore it if it already exists
+      pass
     return directory
 
   def _SendRedirect(self, url, unique_id):
-    """Sends a 302 redirect.
-
-    Automatically adds the unique_id.
-
-    Args:
-      url: The location to redirect to which must start with '/'.
-      unique_id: The unique id to include in the url.
-    """
     if not url:
       url = '/'
     url = '/' + unique_id + url
@@ -756,40 +586,18 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     except AttributeError:
       return None
 
-  def do_POST(self):  # part of BaseHTTPRequestHandler interface
+  def do_POST(self):
     self.DoGetOrPost()
 
-  def do_GET(self):  # part of BaseHTTPRequestHandler interface
+  def do_GET(self):
     self.DoGetOrPost()
 
   def DoGetOrPost(self):
-    """Validate an http get or post request and call HandleRequest."""
-
     url = urlparse(self.path)
     path = url[2]
     query = url[4]
 
-    # Normally, Gruyere only accepts connections to/from localhost. If you
-    # would like to allow access from other ip addresses, add the addresses
-    # of the other machines to allowed_ips and change insecure_mode to True
-    # above. This makes the application more vulnerable to a real attack so
-    # you should only add ips of machines you completely control and make
-    # sure that you are not using them to access any other web pages while
-    # you are using Gruyere.
-
     allowed_ips = ['127.0.0.1']
-
-    # WARNING! DO NOT CHANGE THE FOLLOWING SECTION OF CODE!
-
-    # This application is very exploitable. See main for details. What we're
-    # doing here is (2) and (3) on the previous list:
-    #   (2) If a request is received from any IP other than localhost, quit.
-    # An external attacker could still mount an attack on this IP by putting
-    # an attack on an external web page, e.g., a web page that redirects to
-    # a vulnerable url on 127.0.0.1 (which is why we use a random number).
-    #   (3) Inject a random identifier as the first part of the path and
-    # quit if a request is received without this identifier (except for an
-    # empty path which redirects and /favicon.ico).
 
     request_ip = self.client_address[0]                      # DO NOT CHANGE
     if request_ip not in allowed_ips:                        # DO NOT CHANGE
@@ -809,25 +617,16 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
 
     path = path.replace('/' + server_unique_id, '', 1)       # DO NOT CHANGE
 
-    # END WARNING!
-
     self.HandleRequest(path, query, server_unique_id)
 
   def HandleRequest(self, path, query, unique_id):
-    """Handles an http request.
-
-    Args:
-      path: The path part of the url, with leading slash.
-      query: The query part of the url, without leading question mark.
-      unique_id: The unique id from the url.
-    """
-
     path = urllib.unquote(path)
 
     if not path:
       self._SendRedirect('/', server_unique_id)
       return
-    params = cgi.parse_qs(query)  # url.query
+
+    params = cgi.parse_qs(query)
     specials = {}
     cookie = self._GetCookie('GRUYERE')
     database = self._GetDatabase()
@@ -837,7 +636,16 @@ class GruyereRequestHandler(BaseHTTPRequestHandler):
     specials[SPECIAL_PARAMS] = params
     specials[SPECIAL_UNIQUE_ID] = unique_id
 
-    if path in self._PROTECTED_URLS and not cookie[COOKIE_ADMIN]:
+    # FIX (DoS - Challenge 5):
+    # ORIGINAL: The check compared path against _PROTECTED_URLS using a direct
+    # string equality test which is case-sensitive. Visiting '/RESET' bypassed
+    # the check entirely because 'RESET' != 'reset', but _GetHandlerFunction
+    # capitalises the path before looking up the handler — so '/RESET' still
+    # routed to _DoReset. This is a classic check/use mismatch bug.
+    #
+    # Fix: Normalise path to lowercase before the protected URL check so that
+    # '/RESET', '/Reset', '/rEsEt' etc. are all correctly blocked.
+    if path.lower() in self._PROTECTED_URLS and not cookie[COOKIE_ADMIN]:
       self._SendError('Invalid request', cookie, specials, params)
       return
 

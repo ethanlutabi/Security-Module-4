@@ -24,6 +24,7 @@ import logging
 import operator
 import os
 import pprint
+import re
 import sys
 
 # our modules
@@ -42,49 +43,6 @@ def ExpandTemplate(template, specials, params, name=''):
 
   Returns:
     the expanded template.
-
-  The template language includes these block structures:
-
-    [[include:<filename>]] ...[[/include:<filename>]]
-      Insert the file or if the file cannot be opened insert the contents of
-      the block. The path should use / as a separator regardless of what
-      the underlying operating system is.
-
-    [[for:<variable>]] ... [[/for:<variable>]]
-      Iterate over the variable (which should be a mapping or sequence) and
-      insert the block once for each value. Inside the loop _key is bound to
-      the key value for the iteration.
-
-    [[if:<variable>]] ... [[/if:<variable>]]
-      Expand the contents of the block if the variable is not 'false'.  There
-      is no else; use [[if:!<variable>]] instead.
-
-    Note that in each case the end tags must match the begin tags with a
-    leading slash. This prevents mismatched tags and makes it easier to parse.
-
-  The variable syntax is:
-
-    {{<field>[.<field>]*[:<escaper>]}}
-
-  where <field> is:
-
-    a key to extract from a mapping
-    a number to extract from a sequence
-
-  Variable names that start with '_' are special values:
-    _key = iteration key (inside loops)
-    _this = iteration value (inside loop)
-    _db = the database
-    _cookie = the user's cookie
-    _profile = the user's profile ~ _db.*(_cookie.user)
-
-  If a field name starts with '*' it refers to a dereferenced parameter (orx
-  *_this). For example, _db.*uid retrieves the entry from _db matching the
-  uid parameter.
-
-  The comment syntax is:
-
-    {{#<comment>}}
   """
   t = _ExpandBlocks(template, specials, params, name)
   t = _ExpandVariables(t, specials, params, name)
@@ -142,7 +100,6 @@ INCLUDE_TAG = 'include'
 
 def _ExpandBlock(tag, template, specials, params, name):
   """Expands a single template block."""
-
   tag_type, block_var = tag.split(':', 1)
   if tag_type == INCLUDE_TAG:
     return _ExpandInclude(tag, block_var, template, specials, params, name)
@@ -192,6 +149,66 @@ def _ExpandFor(tag, template, specials, block_data):
   return ''.join(result)
 
 
+# FIX (Stored XSS via HTML Attribute - Challenge 4):
+# The original code used cgi.escape(str(value)) for the :text escaper.
+# cgi.escape only escapes <, >, and & by default. Even with the optional
+# quote=True parameter, it only escapes double quotes — NOT single quotes.
+# Since home.gtl uses single-quoted attributes (style='color:{{color:text}}'),
+# an attacker could inject a single quote to break out of the attribute
+# and add malicious event handlers like onmouseover='alert(1)'.
+#
+# Fix: Replace cgi.escape with _EscapeTextToHtml which escapes ALL dangerous
+# characters including both single quotes (&#39;) and double quotes (&quot;).
+
+def _EscapeTextToHtml(value):
+  """Safely escapes a value for insertion into HTML, including inside attributes.
+
+  Escapes all HTML metacharacters including both single and double quotes,
+  preventing XSS via attribute injection regardless of quote style used.
+
+  Args:
+    value: The string value to escape.
+
+  Returns:
+    The escaped string safe for use in HTML body or attribute context.
+  """
+  meta_chars = {
+      '"':  '&quot;',
+      "'":  '&#39;',   # cgi.escape never escapes single quotes — this is the fix
+      '&':  '&amp;',
+      '<':  '&lt;',
+      '>':  '&gt;',
+  }
+  escaped = ''
+  for char in str(value):
+    escaped += meta_chars.get(char, char)
+  return escaped
+
+
+# FIX (Stored XSS via Attribute - color field):
+# Even with correct HTML escaping, CSS expressions like expression(alert(1))
+# in Internet Explorer can execute JavaScript via the style attribute.
+# We add a color sanitiser that only allows safe color values.
+
+SAFE_COLOR_RE = re.compile(r'^#?[a-zA-Z0-9]*$')
+
+def _SanitizeColor(color):
+  """Sanitizes a color value, returning 'invalid' if it contains unsafe content.
+
+  Only allows color names (letters) or hex codes (#RRGGBB).
+  This prevents CSS expression injection via the color field.
+
+  Args:
+    color: The color string to validate.
+
+  Returns:
+    The original color if safe, or 'invalid' otherwise.
+  """
+  if SAFE_COLOR_RE.match(str(color)):
+    return str(color)
+  return 'invalid'
+
+
 def _ExpandVariable(var, specials, params, name, default=''):
   """Gets a variable value."""
   if var.startswith('#'):  # this is a comment.
@@ -211,12 +228,16 @@ def _ExpandVariable(var, specials, params, name, default=''):
   if inverted:
     value = not value
 
+  # FIX: replaced cgi.escape with _EscapeTextToHtml for :text escaper
+  # so that single quotes in attribute values are also escaped correctly.
   if escaper_name == 'text':
-    value = cgi.escape(str(value))
+    value = _EscapeTextToHtml(str(value))       # FIX: was cgi.escape(str(value))
   elif escaper_name == 'html':
     value = sanitize.SanitizeHtml(str(value))
+  elif escaper_name == 'color':                 # FIX: new :color escaper
+    value = _SanitizeColor(value)
   elif escaper_name == 'pprint':  # for debugging
-    value = '<pre>' + cgi.escape(pprint.pformat(value)) + '</pre>'
+    value = '<pre>' + _EscapeTextToHtml(pprint.pformat(value)) + '</pre>'
 
   if value is None:
     value = ''
@@ -224,12 +245,7 @@ def _ExpandVariable(var, specials, params, name, default=''):
 
 
 def _ExpandValue(var, specials, params, name, default):
-  """Expand one value.
-
-  This expands the <field>.<field>...<field> part of the variable
-  expansion. A field may be of the form *<param> to use the value
-  of a parameter as the field name.
-  """
+  """Expand one value."""
   if var == '_key':
     return name
   elif var == '_this':
@@ -251,14 +267,7 @@ def _ExpandValue(var, specials, params, name, default):
 
 
 def _GetValue(collection, index, default=''):
-  """Gets a single indexed value out of a collection.
-
-  The index is either a key in a mapping or a numeric index into
-  a sequence.
-
-  Returns:
-    value
-  """
+  """Gets a single indexed value out of a collection."""
   if operator.isMappingType(collection) and index in collection:
     value = collection[index]
   elif (operator.isSequenceType(collection) and index.isdigit() and
@@ -278,18 +287,7 @@ def _Cond(test, if_true, if_false):
 
 
 def _FindTag(template, open_marker, close_marker):
-  """Finds a single tag.
-
-  Args:
-    template: the template to search.
-    open_marker: the start of the tag (e.g., '{{').
-    close_marker: the end of the tag (e.g., '}}').
-
-  Returns:
-    (tag, pos1, pos2) where the tag has the open and close markers
-    stripped off and pos1 is the start of the tag and pos2 is the end of
-    the tag. Returns (None, None, None) if there is no tag found.
-  """
+  """Finds a single tag."""
   open_pos = template.find(open_marker)
   close_pos = template.find(close_marker, open_pos)
   if open_pos < 0 or close_pos < 0 or open_pos > close_pos:

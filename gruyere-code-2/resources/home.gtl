@@ -39,7 +39,7 @@
      [[if:icon]]<img alt='' height='32' width='32' src='{{icon:text}}'>[[/if:icon]]
     </td>
     <td>
-      <b><span style='color:{{color:text}}'>[[if:name]]{{name:text}}[[/if:name]][[if:!name]]{{_key}}[[/if:!name]]</span></b>
+      <b><span style='color:{{color:color}}'>[[if:name]]{{name:text}}[[/if:name]][[if:!name]]{{_key}}[[/if:!name]]</span></b>
     </td>
     <td width='100%'><span id='{{_key}}'>{{snippets.0:html}}</span>
     <br>
